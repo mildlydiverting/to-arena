@@ -699,6 +699,7 @@
 
     /* Uses the channel the user picked; false when it has gone, so that a new one is made instead. */
     async function adoptChannel(ch) {
+      let live = null;
       if (client instanceof DryRunClient) {
         journal.channels[ch.key] = { id: ch.targetChannelId, slug: ch.targetSlug, title: ch.targetTitle, owner: null };
       } else {
@@ -706,6 +707,7 @@
           const found = await client.request('GET', `/channels/${ch.targetChannelId}`);
           if (!found?.id || found.state === 'deleted') throw new ArenaError(404, 'deleted');
           journal.channels[ch.key] = pickChannel(found);
+          live = found;
         } catch (err) {
           if (err.status !== 404) throw err;
           log('warn', `The channel “${ch.targetTitle || ch.title}” no longer exists: a new channel is created instead.`);
@@ -715,7 +717,31 @@
       counts.channelsReused++;
       log('ok', `Using existing channel: ${journal.channels[ch.key].title}`);
       persist(journal);
+      if (live) await tagPicked(ch, live.metadata);
       return true;
+    }
+
+    /*
+     * Tags a picked channel like the ones this tool makes, so that the next run finds it again without
+     * being picked again. Are.na merges metadata, so what other tools stored there stays. A channel
+     * already tagged for another collection is left as it is.
+     */
+    async function tagPicked(ch, current) {
+      const { collection } = (SOURCES[plan.source] || SOURCES.cosmos).meta;
+      const tag = ch.metadata || {};
+      const title = journal.channels[ch.key].title;
+      if (current?.[collection] != null && String(current[collection]) !== String(tag[collection])) {
+        log('info', `“${title}” is already linked to another collection: its tag is left as it is.`);
+        return;
+      }
+      const changes = Object.fromEntries(Object.entries(tag).filter(([k, v]) => String(current?.[k] ?? '') !== String(v)));
+      if (!Object.keys(changes).length) return;
+      try {
+        await client.request('PUT', `/channels/${journal.channels[ch.key].id}`, { body: { metadata: changes } });
+      } catch (err) {
+        if (err instanceof AbortedError || [0, 401].includes(err.status)) throw err;
+        log('warn', `Couldn’t tag “${title}” for next time (${err.message}): the transfer carries on, but you may need to pick it again.`);
+      }
     }
 
     async function linkOriginal(step, channel) {

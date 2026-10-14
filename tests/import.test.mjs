@@ -148,7 +148,7 @@ function mockArena({ rate429Every = 0, fail500Once = true, readOnly = false } = 
     }
     if (method === 'GET' && (m = path.match(/^\/channels\/([^/]+)$/))) {
       const c = findChannel(m[1]);
-      return c ? json(200, { id: c.id, slug: c.slug, title: c.title, state: c.state, visibility: c.visibility, owner: { slug: 'me' } }) : json(404, { error: 'Not Found' });
+      return c ? json(200, { id: c.id, slug: c.slug, title: c.title, state: c.state, visibility: c.visibility, metadata: c.metadata, owner: { slug: 'me' } }) : json(404, { error: 'Not Found' });
     }
     if (method === 'GET' && (m = path.match(/^\/channels\/(\d+)\/contents$/))) {
       const c = S.channels.get(+m[1]);
@@ -196,6 +196,16 @@ function mockArena({ rate429Every = 0, fail500Once = true, readOnly = false } = 
         }
       }
       return json(404, {});
+    }
+    if (method === 'PUT' && (m = path.match(/^\/channels\/(\d+)$/))) {
+      const c = S.channels.get(+m[1]);
+      if (!c) return json(404, { error: 'Not Found' });
+      for (const k of Object.keys(b.metadata || {})) assert.match(k, /^\w{1,40}$/);
+      const merged = { ...c.metadata, ...b.metadata }; // like Are.na: keys are added or updated, null removes
+      for (const k of Object.keys(merged)) if (merged[k] === null) delete merged[k];
+      c.metadata = merged;
+      if (b.title) c.title = b.title;
+      return json(200, { id: c.id, slug: c.slug, title: c.title, metadata: c.metadata });
     }
     if (method === 'PUT' && (m = path.match(/^\/blocks\/(\d+)$/))) {
       S.blocks.get(+m[1]).title = b.title;
@@ -384,8 +394,8 @@ const cosmosOptions = { selected: ['1', '2', '3'], includeLibrary: true, visibil
 /* 6. Destinations: sending a collection into an existing channel, and prefixing nested names */
 {
   /* A channel made by hand on Are.na: no source tag in its metadata. */
-  const addChannel = (S, { id, slug, title, visibility = 'public' }) =>
-    S.channels.set(id, { id, slug, title, visibility, metadata: null, items: [], state: 'available' });
+  const addChannel = (S, { id, slug, title, visibility = 'public', metadata = null }) =>
+    S.channels.set(id, { id, slug, title, visibility, metadata, items: [], state: 'available' });
   const pick = (id, slug, title, visibility = 'public') => ({ channelId: id, slug, title, visibility });
   const spyOn = (fetchImpl) => {
     const calls = [];
@@ -495,7 +505,7 @@ const cosmosOptions = { selected: ['1', '2', '3'], includeLibrary: true, visibil
     const kitchens = channelOf(S, '8001');
     assert.equal(kitchens.title, 'interiors (mine) - Kitchens');
     assert.equal(channelOf(S, '7002').title, 'Secret moodboard');
-    assert.equal(channelOf(S, '7001'), undefined, 'the picked channel is not tagged yet');
+    assert.equal(channelOf(S, '7001')?.id, 5002, 'the picked channel is tagged for next time');
     assert.ok(S.channels.get(5002).items.some((i) => i.type === 'Channel' && i.id === kitchens.id), 'sub-channel placed inside the picked channel');
   }
 
@@ -520,6 +530,79 @@ const cosmosOptions = { selected: ['1', '2', '3'], includeLibrary: true, visibil
     const r = await T.runImport({ plan, client: new T.DryRunClient(), journal: T.emptyJournal(), me: null, emit: (e) => e.type === 'channel' && channels.push(e.channel) });
     assert.deepEqual([r.counts.channelsCreated, r.counts.channelsReused], [0, 1]);
     assert.deepEqual([channels[0].id, channels[0].slug, channels[0].title], [5001, 'moodboard', 'moodboard'], 'seeded from the picker');
+  }
+
+  /* Back-tagging: the picked channel is tagged so that the next run finds it without being picked again */
+  {
+    const tag = { pinterest_board_id: '7002', pinterest_slug: 'secret' };
+    const plan = T.buildPlan(pinterest, { ...pinOptions, selected: ['7002'], destinations: { 7002: pick(5001, 'moodboard', 'moodboard') } });
+    const puts = (calls) => calls.filter((c) => c.startsWith('PUT /channels/'));
+
+    /* tagged once, other tools' metadata kept; a later run with a lost journal finds it by the tag */
+    {
+      const { S, fetchImpl } = mockArena({ fail500Once: false });
+      addChannel(S, { id: 5001, slug: 'moodboard', title: 'moodboard', metadata: { other_tool: 'keep me' } });
+      const spy = spyOn(fetchImpl);
+      await T.runImport({ plan, client: client(spy.fetchImpl), journal: T.emptyJournal(), me });
+      assert.deepEqual(S.channels.get(5001).metadata, { other_tool: 'keep me', ...tag }, 'merged, not replaced');
+      assert.deepEqual(puts(spy.calls), ['PUT /channels/5001']);
+
+      spy.calls.length = 0;
+      const again = await T.runImport({ plan, client: client(spy.fetchImpl), journal: T.emptyJournal(), me });
+      assert.deepEqual([again.counts.channelsCreated, again.counts.created, again.counts.channelsReused], [0, 0, 1], 'found through the tag');
+      assert.ok(again.counts.skipped > 0);
+      assert.ok(!spy.calls.includes('POST /channels') && !spy.calls.includes('GET /channels/5001') && !puts(spy.calls).length, 'no pick, no second tag');
+      assert.equal(S.channels.get(5001).items.length, 12);
+    }
+
+    /* already tagged for this collection: nothing to send */
+    {
+      const { S, fetchImpl } = mockArena({ fail500Once: false });
+      addChannel(S, { id: 5001, slug: 'moodboard', title: 'moodboard', metadata: tag });
+      const spy = spyOn(fetchImpl);
+      await T.runImport({ plan, client: client(spy.fetchImpl), journal: T.emptyJournal(), me });
+      assert.equal(puts(spy.calls).length, 0);
+    }
+
+    /* tagged for another collection: left alone, said in the log, blocks still added */
+    {
+      const { S, fetchImpl } = mockArena({ fail500Once: false });
+      const other = { pinterest_board_id: '1234', pinterest_slug: 'elsewhere' };
+      addChannel(S, { id: 5001, slug: 'moodboard', title: 'moodboard', metadata: other });
+      const spy = spyOn(fetchImpl);
+      const logs = [];
+      const r = await T.runImport({ plan, client: client(spy.fetchImpl), journal: T.emptyJournal(), me, emit: (e) => e.type === 'log' && logs.push(e) });
+      assert.equal(puts(spy.calls).length, 0);
+      assert.deepEqual(S.channels.get(5001).metadata, other);
+      assert.ok(logs.some((l) => l.level === 'info' && /another collection/.test(l.message)));
+      assert.equal(r.failures.length, 0);
+      assert.equal(S.channels.get(5001).items.length, 12);
+    }
+
+    /* Are.na refuses the tag: a warning, and the transfer carries on */
+    {
+      const { S, fetchImpl } = mockArena({ fail500Once: false });
+      addChannel(S, { id: 5001, slug: 'moodboard', title: 'moodboard' });
+      const refusing = async (url, init) =>
+        init.method === 'PUT' && /\/channels\/\d+$/.test(url)
+          ? { status: 403, ok: false, headers: new Headers(), text: async () => '{}' }
+          : fetchImpl(url, init);
+      const logs = [];
+      const r = await T.runImport({ plan, client: client(refusing), journal: T.emptyJournal(), me, emit: (e) => e.type === 'log' && logs.push(e) });
+      assert.equal(r.failures.length, 0);
+      assert.ok(logs.some((l) => l.level === 'warn' && /tag/.test(l.message)));
+      assert.equal(S.channels.get(5001).items.length, 12, 'the transfer carried on');
+    }
+
+    /* simulation writes nothing, tags included */
+    {
+      const dry = new T.DryRunClient();
+      const seen = [];
+      const request = dry.request.bind(dry);
+      dry.request = (method, path, opts) => (seen.push(`${method} ${path}`), request(method, path, opts));
+      await T.runImport({ plan, client: dry, journal: T.emptyJournal(), me: null });
+      assert.equal(puts(seen).length, 0);
+    }
   }
 
   console.log('✓ destinations');
