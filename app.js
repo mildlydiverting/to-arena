@@ -11,6 +11,7 @@
     buildPlan,
     checkWriteAccess,
     emptyJournal,
+    listUserChannels,
     normalizeExport,
     normalizeUrl,
     runImport,
@@ -96,6 +97,11 @@
     filename: '',
     selected: new Set(),
     me: null,
+    /* The user's own Are.na channels, fetched once on reaching Transfer; null until then. */
+    availableChannels: null,
+    loadingChannels: false,
+    /* { [collectionId]: 'new' | { channelId, slug, title, visibility } }; absent means 'new'. */
+    destinations: {},
     journal: emptyJournal(),
     plan: null,
     run: null,
@@ -133,6 +139,7 @@
     if (!reachable(id)) return;
     state.step = id;
     render();
+    if (id === 'transfer') loadChannels();
     if (focus) {
       window.scrollTo({ top: 0 });
       document.querySelector(`.panel[data-step="${id}"] .heading`)?.focus({ preventScroll: true });
@@ -203,6 +210,7 @@
       if (state.source !== source) {
         state.data = null;
         state.selected = new Set();
+        state.destinations = {};
         state.waiting = false;
         state.method = source === 'pinterest' && browser !== 'Firefox' ? 'console' : 'bookmark';
         resetDrop();
@@ -407,6 +415,7 @@
     state.waiting = false;
     state.showHowto = false;
     state.selected = new Set(data.collections.filter((c) => !c.system).map((c) => c.id));
+    state.destinations = {};
     $('drop-title').textContent = `✓ ${filename}`;
     $('include-library').checked = !!data.library;
     $('load-error').hidden = true;
@@ -579,6 +588,8 @@
       const me = await client.request('GET', '/me');
       if (!(await checkWriteAccess(client))) throw Object.assign(new Error('This token is read-only'), { readOnly: true });
       state.me = me;
+      state.availableChannels = null;
+      state.destinations = {};
       session.token = token;
       state.journal = loadJournal(me.id);
       saveToken(token);
@@ -677,6 +688,8 @@
     if (busy()) return;
     forgetToken();
     state.me = null;
+    state.availableChannels = null;
+    state.destinations = {};
     session.token = '';
     render();
   });
@@ -759,7 +772,23 @@
       nest: $('nest').checked,
       captions: $('captions').checked,
       credits: $('credits').checked,
+      destinations: state.destinations,
+      prefixNested: !!$('prefix-nested')?.checked,
     };
+  }
+
+  /* The channel list is only needed to pick a destination, so a failure leaves the usual flow untouched. */
+  async function loadChannels() {
+    if (!state.me || state.availableChannels || state.loadingChannels) return;
+    state.loadingChannels = true;
+    try {
+      state.availableChannels = await listUserChannels(makeClient(session.token), state.me, () => {});
+    } catch {
+      state.availableChannels = null;
+    } finally {
+      state.loadingChannels = false;
+    }
+    render();
   }
 
   function updateTransfer() {
