@@ -117,6 +117,7 @@
     { id: 'source', label: 'Source', desc: 'Pick where your saves live.' },
     { id: 'pick', label: 'Pick', desc: 'Choose boards or collections on the site; they come back here.' },
     { id: 'connect', label: 'Connect', desc: 'Link your Are.na account and pick a few settings.' },
+    { id: 'destination', label: 'Destination', desc: 'Create new channels, or pick existing ones.' },
     { id: 'transfer', label: 'Transfer', desc: 'Review, simulate if you like, then create the channels.' },
   ];
 
@@ -128,6 +129,7 @@
         return !!state.source;
       case 'connect':
         return !!state.data;
+      case 'destination':
       case 'transfer':
         return !!(state.data && state.me && state.plan?.stats.channels);
       default:
@@ -139,7 +141,7 @@
     if (!reachable(id)) return;
     state.step = id;
     render();
-    if (id === 'transfer') loadChannels();
+    if (id === 'destination') loadChannels();
     if (focus) {
       window.scrollTo({ top: 0 });
       document.querySelector(`.panel[data-step="${id}"] .heading`)?.focus({ preventScroll: true });
@@ -194,6 +196,7 @@
     if (!state.run) state.plan = state.data ? buildPlan(state.data, options()) : null;
     updatePick();
     updateConnect();
+    updateDestination();
     updateTransfer();
   }
 
@@ -717,7 +720,7 @@
 
   for (const id of ['visibility', 'carousel', 'arena-links', 'captions', 'credits', 'nest', 'image-mode']) $(id).addEventListener('change', render);
 
-  $('connect-next').addEventListener('click', () => go('transfer'));
+  $('connect-next').addEventListener('click', () => go('destination'));
 
   const initials = (name) =>
     String(name || '?')
@@ -777,7 +780,7 @@
     };
   }
 
-  /* The channel list is only needed to pick a destination, so a failure leaves the usual flow untouched. */
+  /* The channel list is only needed to pick a destination (the Destination step), so a failure leaves the usual flow untouched. */
   async function loadChannels() {
     if (!state.me || state.availableChannels || state.loadingChannels) return;
     state.loadingChannels = true;
@@ -790,6 +793,148 @@
     }
     render();
   }
+
+  /* ───────────── Destination ───────────── */
+
+  let destinationsFor = '';
+
+  /* The selected collections, parents first, each with the selected ones inside it. */
+  function selectedCollections() {
+    const picked = state.data.collections.filter((c) => state.selected.has(c.id));
+    const ids = new Set(picked.map((c) => c.id));
+    const out = [];
+    const add = (c, isChild) => {
+      out.push({ c, isChild });
+      for (const child of picked.filter((x) => x.parentId === c.id)) add(child, true);
+    };
+    for (const c of picked.filter((x) => !ids.has(x.parentId))) add(c, false);
+    return out;
+  }
+
+  const channelStatus = () => (state.availableChannels ? 'ready' : state.loadingChannels ? 'loading' : 'failed');
+
+  function destinationRow({ c, isChild }) {
+    const li = el('li', { className: `row row--destination${isChild ? ' row--child' : ''}` });
+    const text = el('span', { className: 'row__text' });
+    text.append(el('span', { className: 'row__name', textContent: c.name || 'Untitled' }), el('span', { className: 'row__meta', textContent: plural(c.elementIds.length, ...site().item) }));
+    const select = el('select');
+    select.setAttribute('aria-label', `Destination for ${c.name || 'Untitled'}`);
+    select.dataset.id = c.id;
+    li.append(text, select);
+    return li;
+  }
+
+  /* Options of one select: “Create new”, the channel picked (if any), and “Pick existing…”. */
+  function syncDestination(select) {
+    const current = state.destinations[select.dataset.id];
+    const picked = current && current !== 'new' ? current : null;
+    const options = [new Option('Create new', 'new')];
+    if (picked) options.push(new Option(`Existing: ${picked.title}`, 'current'));
+    const choose = new Option(picked ? 'Pick another…' : 'Pick existing…', 'pick');
+    choose.disabled = !state.availableChannels;
+    options.push(choose);
+    select.replaceChildren(...options);
+    select.value = picked ? 'current' : 'new';
+  }
+
+  function updateDestination() {
+    if (state.step !== 'destination' || !state.data) return;
+    const rows = selectedCollections();
+    const library = $('include-library').checked && !!state.data.library;
+    const key = [rows.map((r) => r.c.id).join(','), library, channelStatus()].join('|');
+    const list = $('destinations');
+    if (destinationsFor !== key) {
+      list.replaceChildren(...rows.map(destinationRow));
+      if (library) {
+        const li = el('li', { className: 'row row--destination' });
+        const text = el('span', { className: 'row__text' });
+        text.append(el('span', { className: 'row__name', textContent: 'Whole library' }), el('span', { className: 'row__meta', textContent: 'Always a new channel' }));
+        li.appendChild(text);
+        list.appendChild(li);
+      }
+      destinationsFor = key;
+    }
+    for (const select of list.querySelectorAll('select')) syncDestination(select);
+
+    const status = channelStatus();
+    const hint = $('destinations-hint');
+    hint.hidden = status === 'ready';
+    hint.textContent = status === 'loading' ? 'Loading your channels…' : 'Couldn’t load your channels. You can still create new ones; leave this step and come back to try again.';
+    $('prefix-row').hidden = !rows.some((r) => r.isChild);
+    const existing = state.plan?.channels.filter((ch) => ch.targetChannelId != null).length || 0;
+    $('destination-count').textContent = existing ? `${plural(existing, 'channel', 'channels')} already on Are.na` : '';
+  }
+
+  $('prefix-nested').addEventListener('change', render);
+
+  $('destinations').addEventListener('change', (e) => {
+    const id = e.target.dataset.id;
+    if (!id) return;
+    if (e.target.value === 'new') {
+      delete state.destinations[id];
+      render();
+    } else if (e.target.value === 'pick') {
+      openPicker(id);
+    }
+  });
+
+  /* ── Picker: choose one of the user's own channels ── */
+
+  let pickerFor = null;
+  let pickerChoice = null;
+
+  function openPicker(collectionId) {
+    pickerFor = collectionId;
+    const current = state.destinations[collectionId];
+    pickerChoice = current && current !== 'new' ? state.availableChannels.find((ch) => ch.id === current.channelId) || null : null;
+    $('picker-filter').value = '';
+    $('picker-error').hidden = true;
+    const list = $('picker-list');
+    list.replaceChildren();
+    for (const ch of state.availableChannels) {
+      const li = document.createElement('li');
+      li.dataset.name = normalize(ch.title);
+      const label = el('label', { className: 'row' });
+      const radio = el('input', { type: 'radio', name: 'picker-channel', value: String(ch.id), checked: pickerChoice?.id === ch.id });
+      radio.addEventListener('change', () => {
+        pickerChoice = ch;
+        $('picker-error').hidden = true;
+      });
+      const text = el('span', { className: 'row__text' });
+      const meta = [ch.visibility, ch.length != null ? plural(ch.length, 'block', 'blocks') : ''].filter(Boolean);
+      text.append(el('span', { className: 'row__name', textContent: ch.title || 'Untitled' }), el('span', { className: 'row__meta', textContent: meta.join(' · ') }));
+      label.append(radio, text);
+      li.appendChild(label);
+      list.appendChild(li);
+    }
+    if (!state.availableChannels.length) list.appendChild(el('li', { className: 'row', textContent: 'You don’t have any channels yet.' }));
+    $('picker').showModal();
+  }
+
+  $('picker-filter').addEventListener('input', (e) => {
+    const q = normalize(e.target.value.trim());
+    for (const li of $('picker-list').children) li.hidden = !!q && !(li.dataset.name || '').includes(q);
+  });
+
+  $('picker-choose').addEventListener('click', () => {
+    const fail = (message) => {
+      $('picker-error').textContent = message;
+      $('picker-error').hidden = false;
+    };
+    if (!pickerChoice) return fail('Choose a channel first.');
+    const clash = Object.entries(state.destinations).find(([id, d]) => id !== pickerFor && state.selected.has(id) && d !== 'new' && d.channelId === pickerChoice.id);
+    if (clash) {
+      const other = state.data.collections.find((c) => c.id === clash[0]);
+      return fail(`“${pickerChoice.title}” is already the destination of “${other?.name || 'another collection'}”. Choose another channel.`);
+    }
+    const { id, slug, title, visibility } = pickerChoice;
+    state.destinations[pickerFor] = { channelId: id, slug, title, visibility };
+    $('picker').close();
+  });
+
+  $('picker-cancel').addEventListener('click', () => $('picker').close());
+  /* Closing, however it happens (Escape too), puts the select back in step with the choice. */
+  $('picker').addEventListener('close', render);
 
   function updateTransfer() {
     const { me, run } = state;
@@ -810,7 +955,15 @@
     const table = $('plan-table');
     table.replaceChildren();
     const row = (label, value) => table.append(el('dt', { textContent: label }), el('dd', { textContent: value }));
-    row('Channels', n(stats.channels) + (stats.nests ? ` (${n(stats.nests)} inside another)` : ''));
+    const existing = state.plan.channels.filter((c) => c.targetChannelId != null);
+    if (existing.length) {
+      const fresh = new Set(state.plan.channels.filter((c) => c.targetChannelId == null).map((c) => c.key));
+      const nested = state.plan.nests.filter((x) => fresh.has(x.childKey)).length;
+      row('New channels', n(fresh.size) + (nested ? ` (${n(nested)} inside another)` : ''));
+      row('Using existing', n(existing.length));
+    } else {
+      row('Channels', n(stats.channels) + (stats.nests ? ` (${n(stats.nests)} inside another)` : ''));
+    }
     row('New blocks', n(stats.blocks));
     if (stats.reused) row('Extra connections, for items in several channels', n(stats.reused));
     if (stats.arena) row('Connections to Are.na originals', n(stats.arena));
@@ -827,6 +980,14 @@
         ` in total. This transfer adds ${n(total)}`,
         total > FREE_TIER_LIMIT ? ', so it would stop partway: upgrade to Premium, or select less.' : ', on top of what you already have.'
       );
+    }
+
+    const notes = $('plan-notes');
+    const mismatched = state.plan.channels.filter((c) => c.targetChannelId != null && c.targetVisibility && c.targetVisibility !== c.visibility);
+    notes.hidden = !mismatched.length;
+    if (mismatched.length) {
+      const names = mismatched.map((c) => `“${c.targetTitle || c.title}”`).join(', ');
+      notes.textContent = `${names} ${mismatched.length === 1 ? 'keeps its' : 'keep their'} current privacy, which differs from the setting you chose: existing channels are never changed.`;
     }
 
     simulate.disabled = busy();

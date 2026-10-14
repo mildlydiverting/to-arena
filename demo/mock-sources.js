@@ -308,7 +308,7 @@
    * An in-memory Are.na: channels, blocks and connections, with positions (1 = bottom, highest =
    * top), a read-only token, and one rate-limit pause so the countdown can be seen.
    */
-  function arenaApi({ latency = 35, pauseAfterWrites = 18, pauseSeconds = 3, tier = 'premium' } = {}) {
+  function arenaApi({ latency = 35, pauseAfterWrites = 18, pauseSeconds = 3, tier = 'premium', existing = [] } = {}) {
     const S = { channels: new Map(), blocks: new Map(), nextId: 1000, nextConn: 1, writes: 0, paused: false };
     for (const [id, title] of Object.entries(ARENA_ORIGINALS)) S.blocks.set(Number(id), { id: Number(id), external: true, kind: 'Image', title, value: image(`arena${id}`) });
 
@@ -317,6 +317,18 @@
       const p = +q.get('page') || 1;
       return { data: arr.slice((p - 1) * per, p * per), meta: { has_more_pages: p * per < arr.length } };
     };
+    /* Channels the user already has, made by hand: `existing` is a list of { title, visibility, blocks }. */
+    for (const { title, visibility = 'public', blocks = 0 } of existing) {
+      const id = S.nextId++;
+      const items = [];
+      for (let i = 0; i < blocks; i++) {
+        const blockId = S.nextId++;
+        S.blocks.set(blockId, { id: blockId, kind: 'Text', title: `${title} ${i + 1}`, metadata: null });
+        items.push({ type: 'Block', id: blockId, connId: S.nextConn++, metadata: null });
+      }
+      S.channels.set(id, { id, slug: `${String(title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}-${id}`, title, visibility, metadata: null, items });
+    }
+
     const findChannel = (idOrSlug) => S.channels.get(+idOrSlug) || [...S.channels.values()].find((c) => c.slug === idOrSlug);
     const connect = (c, item, metadata) => c.items.push({ ...item, connId: S.nextConn++, metadata: metadata || null });
     const view = (it, index) => {
@@ -347,12 +359,12 @@
       let m;
       if (method === 'GET' && path === '/me') return json({ id: 42, slug: 'you', name: 'You (demo)', tier, avatar: null });
       if (method === 'GET' && (m = path.match(/^\/users\/(\d+)\/contents$/))) {
-        const mine = [...S.channels.values()].map((c) => ({ id: c.id, type: 'Channel', slug: c.slug, title: c.title, metadata: c.metadata, state: 'available' }));
+        const mine = [...S.channels.values()].map((c) => ({ id: c.id, type: 'Channel', slug: c.slug, title: c.title, metadata: c.metadata, state: 'available', visibility: c.visibility, length: c.items.length }));
         return json(page(mine, u.searchParams));
       }
       if (method === 'GET' && (m = path.match(/^\/channels\/([^/]+)$/))) {
         const c = findChannel(m[1]);
-        return c ? json({ id: c.id, slug: c.slug, title: c.title, state: 'available' }) : json({ error: 'Not Found' }, 404);
+        return c ? json({ id: c.id, slug: c.slug, title: c.title, state: 'available', visibility: c.visibility, owner: { slug: 'you' } }) : json({ error: 'Not Found' }, 404);
       }
       if (method === 'GET' && (m = path.match(/^\/channels\/(\d+)\/contents$/))) {
         const c = S.channels.get(+m[1]);
