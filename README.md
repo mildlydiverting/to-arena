@@ -132,7 +132,8 @@ node tests/export.test.mjs
 
 To publish a new version of the download, zip the page files (without `tests/` and `demo/`) in a folder named
 `To Are.na`, then attach `To-Arena.zip` to a new [release](https://github.com/TanguyCaruel/to-arena/releases). Bump
-`VERSION` in `demo/boot.js` so the demo loads the new scripts.
+`VERSION` in `demo/boot.js` with any change to the page files (`index.html`, `styles.css`, `app.js`, `arena.js`) so the
+demo loads the new scripts.
 
 ## License
 
