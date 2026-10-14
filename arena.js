@@ -389,6 +389,8 @@
       carousel = 'first',
       arenaLinks = true,
       libraryTitle = 'Cosmos · all items',
+      destinations = {},
+      prefixNested = false,
     } = options;
     const source = data.source || 'cosmos';
     const { prefix, meta, library } = SOURCES[source];
@@ -406,16 +408,36 @@
       }
     }
 
+    /* An existing Are.na channel chosen for a collection: { channelId, slug, title, visibility }. */
+    const picked = (c) => {
+      const d = Object.hasOwn(destinations, c.id) ? destinations[c.id] : null;
+      return d && typeof d === 'object' && d.channelId != null ? d : null;
+    };
+    const byId = new Map(collections.map((c) => [c.id, c]));
+    /* The names of a collection's selected ancestors, from the top: a picked channel lends its own title. */
+    const lineage = (c) => {
+      const names = [];
+      for (const seen = new Set([c.id]); isChild(c) && !seen.has(c.parentId); ) {
+        c = byId.get(c.parentId);
+        seen.add(c.id);
+        names.unshift(picked(c)?.title || c.name || 'Untitled');
+      }
+      return names;
+    };
+
     const channels = collections.map((c) => {
       const inChildren = c.includesChildren && nestedChildren.get(c.id);
+      const target = picked(c);
+      const name = c.name || 'Untitled';
       return {
         key: `${prefix}${c.id}`,
-        title: c.name || 'Untitled',
+        title: prefixNested && !target ? [...lineage(c), name].join(' - ') : name,
         description: c.description || '',
         visibility: visibilityFor(visibility, c.isPrivate),
         parentKey: nest && isChild(c) ? `${prefix}${c.parentId}` : null,
         elementIds: inChildren ? c.elementIds.filter((id) => !inChildren.has(id)) : c.elementIds,
         metadata: clean({ [meta.collection]: c.id, [meta.slug]: c.slug }),
+        ...(target && { targetChannelId: target.channelId, targetSlug: target.slug, targetTitle: target.title, targetVisibility: target.visibility }),
       };
     });
     if (includeLibrary && data.library) {
@@ -565,6 +587,14 @@
     return items;
   }
 
+  /* The channels the user owns, for choosing an existing destination. */
+  async function listUserChannels(client, me, checkAbort = () => {}) {
+    const found = await listAll(client, `/users/${me.id}/contents`, { type: 'Channel' }, checkAbort, 50);
+    return found
+      .filter((ch) => ch.state !== 'deleted')
+      .map((ch) => ({ id: ch.id, slug: ch.slug, title: ch.title, visibility: ch.visibility, length: ch.counts?.contents ?? ch.length ?? null, metadata: ch.metadata ?? null }));
+  }
+
   async function runImport({ plan, client, journal, me, imageMode = 'url', signal, fetchImpl, emit = () => {}, persist = () => {} }) {
     const doFetch = fetchImpl || ((...args) => fetch(...args));
     const resolve = refResolver(client);
@@ -588,6 +618,8 @@
       checkAbort();
       if (journal.channels[ch.key]) {
         counts.channelsReused++;
+      } else if (ch.targetChannelId != null && (await adoptChannel(ch))) {
+        /* an existing channel chosen by the user */
       } else {
         const created = await client.request('POST', '/channels', {
           body: clean({ title: ch.title, visibility: ch.visibility, description: ch.description, metadata: ch.metadata }),
@@ -663,6 +695,27 @@
 
     function isFatal(err) {
       return err instanceof AbortedError || [0, 401, 403].includes(err.status) || (err.status === 404 && err.channel);
+    }
+
+    /* Uses the channel the user picked; false when it has gone, so that a new one is made instead. */
+    async function adoptChannel(ch) {
+      if (client instanceof DryRunClient) {
+        journal.channels[ch.key] = { id: ch.targetChannelId, slug: ch.targetSlug, title: ch.targetTitle, owner: null };
+      } else {
+        try {
+          const found = await client.request('GET', `/channels/${ch.targetChannelId}`);
+          if (!found?.id || found.state === 'deleted') throw new ArenaError(404, 'deleted');
+          journal.channels[ch.key] = pickChannel(found);
+        } catch (err) {
+          if (err.status !== 404) throw err;
+          log('warn', `The channel “${ch.targetTitle || ch.title}” no longer exists: a new channel is created instead.`);
+          return false;
+        }
+      }
+      counts.channelsReused++;
+      log('ok', `Using existing channel: ${journal.channels[ch.key].title}`);
+      persist(journal);
+      return true;
     }
 
     async function linkOriginal(step, channel) {
@@ -807,6 +860,7 @@
     checkWriteAccess,
     elementSteps,
     emptyJournal,
+    listUserChannels,
     normalizeExport,
     normalizeUrl,
     runImport,

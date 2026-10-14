@@ -144,11 +144,11 @@ function mockArena({ rate429Every = 0, fail500Once = true, readOnly = false } = 
     let m;
     if (method === 'GET' && (m = path.match(/^\/users\/(\d+)\/contents$/))) {
       const mine = [...S.channels.values()].filter((c) => !c.external && c.state !== 'deleted');
-      return json(200, page(mine.map((c) => ({ id: c.id, type: 'Channel', slug: c.slug, title: c.title, metadata: c.metadata, state: c.state })), u.searchParams));
+      return json(200, page(mine.map((c) => ({ id: c.id, type: 'Channel', slug: c.slug, title: c.title, metadata: c.metadata, state: c.state, visibility: c.visibility, length: c.items.length })), u.searchParams));
     }
     if (method === 'GET' && (m = path.match(/^\/channels\/([^/]+)$/))) {
       const c = findChannel(m[1]);
-      return c ? json(200, { id: c.id, slug: c.slug, title: c.title, state: c.state }) : json(404, { error: 'Not Found' });
+      return c ? json(200, { id: c.id, slug: c.slug, title: c.title, state: c.state, visibility: c.visibility, owner: { slug: 'me' } }) : json(404, { error: 'Not Found' });
     }
     if (method === 'GET' && (m = path.match(/^\/channels\/(\d+)\/contents$/))) {
       const c = S.channels.get(+m[1]);
@@ -379,6 +379,150 @@ const cosmosOptions = { selected: ['1', '2', '3'], includeLibrary: true, visibil
   const r = await T.runImport({ plan, client: new T.DryRunClient(), journal: T.emptyJournal(), me: null });
   assert.equal(r.counts.created, plan.stats.blocks);
   console.log('✓ simulation', r.counts);
+}
+
+/* 6. Destinations: sending a collection into an existing channel, and prefixing nested names */
+{
+  /* A channel made by hand on Are.na: no source tag in its metadata. */
+  const addChannel = (S, { id, slug, title, visibility = 'public' }) =>
+    S.channels.set(id, { id, slug, title, visibility, metadata: null, items: [], state: 'available' });
+  const pick = (id, slug, title, visibility = 'public') => ({ channelId: id, slug, title, visibility });
+  const spyOn = (fetchImpl) => {
+    const calls = [];
+    return { calls, fetchImpl: (url, init) => (calls.push(`${init.method} ${new URL(url).pathname.replace('/v3', '')}`), fetchImpl(url, init)) };
+  };
+  const pinOptions = { visibility: 'mirror', nest: true, ...NEW_DEFAULTS };
+
+  /* Listing the user's channels */
+  {
+    const { S, fetchImpl } = mockArena({ fail500Once: false });
+    addChannel(S, { id: 5001, slug: 'one', title: 'One' });
+    addChannel(S, { id: 5002, slug: 'two', title: 'Two', visibility: 'private' });
+    const list = await T.listUserChannels(client(fetchImpl), me, () => {});
+    assert.deepEqual(list.map((c) => [c.id, c.slug, c.title, c.visibility, c.length]), [[5001, 'one', 'One', 'public', 0], [5002, 'two', 'Two', 'private', 0]]);
+    assert.ok(list.every((c) => 'metadata' in c), 'metadata is kept');
+  }
+
+  /* Backward compatibility: the new options absent, empty or off change nothing */
+  {
+    const base = T.buildPlan(pinterest, { ...pinOptions, selected: ['7001', '8001', '7002'] });
+    const same = (extra) => assert.deepEqual(T.buildPlan(pinterest, { ...pinOptions, selected: ['7001', '8001', '7002'], ...extra }), base);
+    same({ destinations: {} });
+    same({ prefixNested: false });
+    same({ destinations: { 7001: 'new' } });
+    assert.ok(base.channels.every((c) => !Object.keys(c).some((k) => k.startsWith('target'))), 'no target fields by default');
+    const cosmosWith = (extra) => T.buildPlan(cosmos, { ...cosmosOptions, ...NEW_DEFAULTS, ...extra });
+    assert.deepEqual(cosmosWith({ destinations: {}, prefixNested: false }), cosmosWith({}));
+  }
+
+  /* Plan: mix of new and existing, the library stays new-only */
+  {
+    const plan = T.buildPlan(pinterest, { ...pinOptions, selected: ['7001', '8001', '7002'], destinations: { 7001: pick(5002, 'mine', 'mine'), 7002: 'new' } });
+    const by = (key) => plan.channels.find((c) => c.key === key);
+    assert.deepEqual(
+      [by('pinterest:7001').targetChannelId, by('pinterest:7001').targetSlug, by('pinterest:7001').targetTitle, by('pinterest:7001').targetVisibility],
+      [5002, 'mine', 'mine', 'public']
+    );
+    assert.equal(by('pinterest:7001').title, 'Interiors', 'source title is kept on the plan');
+    assert.equal(by('pinterest:7002').targetChannelId, undefined);
+    assert.equal(by('pinterest:8001').targetChannelId, undefined);
+    assert.equal(by('pinterest:8001').parentKey, 'pinterest:7001', 'nesting still resolves');
+
+    const withLibrary = T.buildPlan(cosmos, { ...cosmosOptions, ...NEW_DEFAULTS, destinations: { __library__: pick(5009, 'lib', 'lib') } });
+    assert.equal(withLibrary.channels.find((c) => c.key === '__library__').targetChannelId, undefined, 'library is always new');
+  }
+
+  /* Plan: names of nested channels */
+  {
+    const chain = T.normalizeExport({
+      schema: 'cosmos-export/1',
+      user: { id: '1', username: 'test' },
+      elements: {},
+      collections: [
+        { id: 'a', name: 'A', parentId: null, elementIds: [] },
+        { id: 'b', name: 'B', parentId: 'a', elementIds: [] },
+        { id: 'c', name: 'C', parentId: 'b', elementIds: [] },
+      ],
+    });
+    const titles = (extra) => Object.fromEntries(T.buildPlan(chain, { selected: ['a', 'b', 'c'], ...extra }).channels.map((c) => [c.key, c.title]));
+    assert.deepEqual(titles({}), { a: 'A', b: 'B', c: 'C' }, 'off: unchanged');
+    assert.deepEqual(titles({ prefixNested: true }), { a: 'A', b: 'A - B', c: 'A - B - C' }, 'walks the whole chain');
+    assert.deepEqual(titles({ prefixNested: true, destinations: { a: pick(1, 'x', 'drawing') } }), { a: 'A', b: 'drawing - B', c: 'drawing - B - C' }, 'a picked parent lends its own title');
+    assert.deepEqual(titles({ prefixNested: true, destinations: { b: pick(2, 'y', 'Middle') } }), { a: 'A', b: 'B', c: 'A - Middle - C' }, 'a picked channel is not renamed');
+    assert.deepEqual(titles({ prefixNested: true, nest: false }), { a: 'A', b: 'A - B', c: 'A - B - C' }, 'flattened children keep their lineage');
+    assert.ok(T.buildPlan(chain, { selected: ['a', 'b', 'c'], prefixNested: true, nest: false }).channels.every((c) => c.parentKey === null));
+    assert.deepEqual(titles({ prefixNested: true, selected: ['b', 'c'] }), { b: 'B', c: 'B - C' }, 'a parent that is not selected is not used');
+  }
+
+  /* Run: pick an existing channel, no journal; then run again with the journal; the source stays private, the channel stays public */
+  {
+    const { S, fetchImpl } = mockArena({ fail500Once: false });
+    addChannel(S, { id: 5001, slug: 'moodboard', title: 'moodboard', visibility: 'public' });
+    const spy = spyOn(fetchImpl);
+    const plan = T.buildPlan(pinterest, { ...pinOptions, selected: ['7002'], destinations: { 7002: pick(5001, 'moodboard', 'moodboard', 'public') } });
+    assert.equal(plan.channels[0].visibility, 'private');
+    const journal = T.emptyJournal();
+    const r = await T.runImport({ plan, client: client(spy.fetchImpl), journal, me });
+    assert.equal(r.failures.length, 0);
+    assert.ok(!spy.calls.includes('POST /channels'), 'no channel is created');
+    assert.deepEqual([r.counts.channelsCreated, r.counts.channelsReused], [0, 1]);
+    assert.equal(journal.channels['pinterest:7002'].id, 5001);
+    assert.equal(S.channels.get(5001).items.length, 12, 'blocks are added to the picked channel');
+    assert.equal(S.channels.get(5001).visibility, 'public', 'visibility of a picked channel is left alone');
+    assert.equal([...S.channels.values()].filter((c) => !c.external).length, 1, 'nothing else was made');
+
+    spy.calls.length = 0;
+    const again = await T.runImport({ plan, client: client(spy.fetchImpl), journal, me });
+    assert.ok(!spy.calls.includes('POST /channels') && !spy.calls.includes('POST /blocks'));
+    assert.deepEqual([again.counts.created, again.counts.channelsCreated, again.counts.channelsReused], [0, 0, 1]);
+    assert.ok(again.counts.skipped > 0, 'earlier work is recognised');
+    assert.equal(S.channels.get(5001).items.length, 12);
+  }
+
+  /* Run: new and existing together, with a prefixed sub-channel inside the picked one */
+  {
+    const { S, fetchImpl } = mockArena({ fail500Once: false });
+    addChannel(S, { id: 5002, slug: 'interiors-mine', title: 'interiors (mine)' });
+    const plan = T.buildPlan(pinterest, {
+      ...pinOptions,
+      selected: ['7001', '8001', '7002'],
+      prefixNested: true,
+      destinations: { 7001: pick(5002, 'interiors-mine', 'interiors (mine)'), 7002: 'new' },
+    });
+    const r = await T.runImport({ plan, client: client(fetchImpl), journal: T.emptyJournal(), me });
+    assert.equal(r.failures.length, 0);
+    assert.deepEqual([r.counts.channelsCreated, r.counts.channelsReused], [2, 1]);
+    const kitchens = channelOf(S, '8001');
+    assert.equal(kitchens.title, 'interiors (mine) - Kitchens');
+    assert.equal(channelOf(S, '7002').title, 'Secret moodboard');
+    assert.equal(channelOf(S, '7001'), undefined, 'the picked channel is not tagged yet');
+    assert.ok(S.channels.get(5002).items.some((i) => i.type === 'Channel' && i.id === kitchens.id), 'sub-channel placed inside the picked channel');
+  }
+
+  /* Run: the picked channel was deleted since the pick */
+  {
+    const { S, fetchImpl } = mockArena({ fail500Once: false });
+    const plan = T.buildPlan(pinterest, { ...pinOptions, selected: ['7002'], destinations: { 7002: pick(5003, 'gone', 'gone') } });
+    const logs = [];
+    const journal = T.emptyJournal();
+    const r = await T.runImport({ plan, client: client(fetchImpl), journal, me, emit: (e) => e.type === 'log' && logs.push(e) });
+    assert.equal(r.failures.length, 0);
+    assert.deepEqual([r.counts.channelsCreated, r.counts.channelsReused], [1, 0], 'a new channel is made instead');
+    assert.ok(logs.some((l) => l.level === 'warn' && /gone/.test(l.message)), 'the fallback is logged');
+    assert.equal(channelOf(S, '7002').title, 'Secret moodboard');
+    assert.notEqual(journal.channels['pinterest:7002'].id, 5003);
+  }
+
+  /* Simulation: no stubs needed, nothing is read or written */
+  {
+    const plan = T.buildPlan(pinterest, { ...pinOptions, selected: ['7002'], destinations: { 7002: pick(5001, 'moodboard', 'moodboard') } });
+    const channels = [];
+    const r = await T.runImport({ plan, client: new T.DryRunClient(), journal: T.emptyJournal(), me: null, emit: (e) => e.type === 'channel' && channels.push(e.channel) });
+    assert.deepEqual([r.counts.channelsCreated, r.counts.channelsReused], [0, 1]);
+    assert.deepEqual([channels[0].id, channels[0].slug, channels[0].title], [5001, 'moodboard', 'moodboard'], 'seeded from the picker');
+  }
+
+  console.log('✓ destinations');
 }
 
 console.log('ALL TESTS PASS');
