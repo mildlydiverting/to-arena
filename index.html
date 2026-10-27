@@ -151,7 +151,12 @@
 
             <div class="settings">
               <h3 class="col-head">Settings</h3>
-              <label class="field">
+              <label class="check" id="batch-mode-row" hidden>
+                <input type="checkbox" id="batch-mode" checked />
+                <span>Batch mode — much quieter imports (Are.na Premium)</span>
+              </label>
+              <p class="hint" id="batch-mode-hint" hidden>New channels are made private. Existing non-private destinations fall back to single-POST (noisy for those).</p>
+              <label class="field" id="visibility-row">
                 <span>Channel privacy</span>
                 <select id="visibility">
                   <option value="mirror">Same as the source (private stays private)</option>

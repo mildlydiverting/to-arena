@@ -36,6 +36,7 @@
   const n = (x) => nf.format(x);
   const plural = (count, one, many) => `${n(count)} ${count === 1 ? one : many}`;
 
+  const BATCH_MAX = 50;
   const TOKEN_KEY = 'to-arena:token';
   const LEGACY_TOKEN_KEY = 'cosmos-to-arena:token';
   /* Same key as the first versions, so their history keeps preventing duplicates. */
@@ -718,7 +719,7 @@
     render();
   });
 
-  for (const id of ['visibility', 'carousel', 'arena-links', 'captions', 'credits', 'nest', 'image-mode']) $(id).addEventListener('change', render);
+  for (const id of ['visibility', 'carousel', 'arena-links', 'captions', 'credits', 'nest', 'image-mode', 'batch-mode']) $(id).addEventListener('change', render);
 
   $('connect-next').addEventListener('click', () => go('destination'));
 
@@ -745,6 +746,13 @@
     $('connect-form').hidden = !!me;
     $('account').hidden = !me;
     $('topbar-account').hidden = !me;
+    /* The batch endpoint is Premium-only, but Supporter accounts sometimes have access too.
+     * Show the toggle for any paid tier; the 403 fallback catches the ones that don't. */
+    const canBatch = !!(me && me.tier && me.tier !== 'free');
+    $('batch-mode-row').hidden = !canBatch;
+    $('batch-mode-hint').hidden = !canBatch || !$('batch-mode').checked;
+    /* When batch mode is on, new channels are forced private — the visibility selector doesn't apply. */
+    $('visibility-row').hidden = canBatch && $('batch-mode').checked;
     if (me) {
       const name = me.name || me.slug;
       const tier = { free: 'free account', premium: 'Premium', supporter: 'Supporter' }[me.tier] || me.tier;
@@ -766,10 +774,12 @@
   /* ───────────── Transfer ───────────── */
 
   function options() {
+    const batchMode = !!(state.me && state.me.tier && state.me.tier !== 'free') && $('batch-mode').checked;
     return {
       selected: [...state.selected],
       includeLibrary: $('include-library').checked,
-      visibility: $('visibility').value,
+      /* In batch mode, new channels are forced private at create time, so the visibility choice doesn't apply. */
+      visibility: batchMode ? 'private' : $('visibility').value,
       carousel: $('carousel').value,
       arenaLinks: $('arena-links').checked,
       nest: $('nest').checked,
@@ -777,6 +787,7 @@
       credits: $('credits').checked,
       destinations: state.destinations,
       prefixNested: !!$('prefix-nested')?.checked,
+      batchMode,
     };
   }
 
@@ -968,6 +979,26 @@
     if (stats.reused) row('Extra connections, for items in several channels', n(stats.reused));
     if (stats.arena) row('Connections to Are.na originals', n(stats.arena));
     if (stats.skippedElements) row('Items without content, skipped', n(stats.skippedElements));
+    /* Method: how new blocks will be sent (batch vs one-at-a-time, counted per step). */
+    const batchMode = !!(me && me.tier && me.tier !== 'free') && $('batch-mode').checked;
+    const batchable = (ch) => batchMode && (ch.targetChannelId == null || ch.targetVisibility === 'private');
+    const channelByKey = new Map(state.plan.channels.map((c) => [c.key, c]));
+    let batchBlocks = 0;
+    let singleBlocks = 0;
+    for (const step of state.plan.steps) {
+      if (step.target || !step.payload) continue; /* arena-ref steps use connections, not creates */
+      const ch = channelByKey.get(step.channelKey);
+      if (ch && batchable(ch)) batchBlocks++; else singleBlocks++;
+    }
+    if (batchMode && batchBlocks && !singleBlocks) {
+      row('Method', `Batched — Premium quiet mode (≤ ${BATCH_MAX} per request)`);
+    } else if (batchMode && batchBlocks && singleBlocks) {
+      row('Method', `Mixed: ${n(batchBlocks)} batched (Premium), ${n(singleBlocks)} one at a time (non-private destinations)`);
+    } else if (batchMode && !batchBlocks && singleBlocks) {
+      row('Method', 'One at a time — all destinations are non-private, so batching doesn’t apply');
+    } else {
+      row('Method', 'One at a time');
+    }
     row('Estimated time', demo ? 'a few seconds in the demo' : `about ${n(minutes)} min, plus any pause Are.na asks for`);
 
     const warning = $('plan-warning');
@@ -1119,6 +1150,7 @@
         journal,
         me: dryRun ? null : state.me,
         imageMode: $('image-mode').value,
+        batchMode: !!(state.me && state.me.tier && state.me.tier !== 'free') && $('batch-mode').checked,
         signal,
         persist,
         emit: (event) => onImportEvent(run, event),

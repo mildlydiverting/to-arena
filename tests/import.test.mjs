@@ -94,7 +94,7 @@ const pinterest = T.normalizeExport({
  * As on Are.na: position 1 is the bottom of a channel, the highest the top (latest additions).
  * items[] runs from bottom to top; position = index + 1.
  */
-function mockArena({ rate429Every = 0, fail500Once = true, readOnly = false } = {}) {
+function mockArena({ rate429Every = 0, fail500Once = true, readOnly = false, noBatch = false } = {}) {
   const S = { channels: new Map(), blocks: new Map(), nextId: 1000, nextConn: 1, writes: 0, did500: false };
   for (const id of [ORIGINAL_BLOCK, ORIGINAL_IMAGE]) S.blocks.set(id, { id, external: true, kind: 'Image', title: 'original' });
   S.channels.set(ORIGINAL_CHANNEL.id, { id: ORIGINAL_CHANNEL.id, slug: ORIGINAL_CHANNEL.slug, title: 'Motion Theory', metadata: null, items: [], state: 'available', external: true });
@@ -175,6 +175,32 @@ function mockArena({ rate429Every = 0, fail500Once = true, readOnly = false } = 
       S.blocks.set(id, { id, kind, title: b.title || '', metadata: b.metadata, sourceUrl: kind === 'Link' ? b.value : b.original_source_url || null, payload: b });
       connect(c, { type: 'Block', id });
       return json(201, { id, type: 'PendingBlock' });
+    }
+    if (method === 'POST' && path === '/blocks/batch') {
+      if (noBatch) return json(403, { error: 'Forbidden', code: 403, details: { message: 'Premium subscription required' } });
+      assert.ok(Array.isArray(b.channel_ids) && b.channel_ids.length);
+      assert.ok(Array.isArray(b.blocks) && b.blocks.length <= 50);
+      const targets = b.channel_ids.map((id) => S.channels.get(id));
+      if (targets.some((c) => !c)) return json(404, { error: 'Not Found' });
+      if (targets.some((c) => c.visibility !== 'private')) return json(422, { error: 'Batch destinations must be private' });
+      const batchId = `test-batch-${S.nextId++}`;
+      const successful = [];
+      b.blocks.forEach((blk, index) => {
+        assert.ok(blk.value, 'batch block value is required');
+        const isUrl = /^https?:\/\//.test(blk.value);
+        const kind = !isUrl ? 'Text' : /^https:\/\/(cdn\.cosmos\.so|i\.pinimg\.com|v1\.pinimg\.com)\//.test(blk.value) ? 'Image' : 'Link';
+        const id = S.nextId++;
+        S.blocks.set(id, { id, kind, title: blk.title || '', metadata: blk.metadata, sourceUrl: kind === 'Link' ? blk.value : blk.original_source_url || null, payload: blk });
+        for (const c of targets) connect(c, { type: 'Block', id });
+        successful.push({ index, block_id: id });
+      });
+      S.batches = S.batches || new Map();
+      S.batches.set(batchId, { batch_id: batchId, status: 'completed', total: b.blocks.length, successful_count: successful.length, failed_count: 0, successful, failed: [], created_at: new Date().toISOString(), completed_at: new Date().toISOString() });
+      return json(202, { batch_id: batchId, status: 'pending', total: b.blocks.length });
+    }
+    if (method === 'GET' && (m = path.match(/^\/blocks\/batch\/(.+)$/))) {
+      const batch = S.batches?.get(m[1]);
+      return batch ? json(200, batch) : json(404, { error: 'Not Found' });
     }
     if (method === 'POST' && path === '/connections') {
       const targets = b.channels || (b.channel_ids || []).map((id) => ({ id }));
@@ -606,6 +632,41 @@ const cosmosOptions = { selected: ['1', '2', '3'], includeLibrary: true, visibil
   }
 
   console.log('✓ destinations');
+}
+
+/* Batch mode: new channels forced private, blocks created via POST /blocks/batch, same end state. */
+{
+  const plan = T.buildPlan(cosmos, { selected: ['1'], visibility: 'private' });
+  const { S, fetchImpl } = mockArena({ fail500Once: false });
+  const calls = [];
+  const spied = (url, init) => (calls.push(`${init.method} ${new URL(url).pathname.replace('/v3', '').split('?')[0]}`), fetchImpl(url, init));
+  const r = await T.runImport({ plan, client: client(spied), journal: T.emptyJournal(), me, batchMode: true });
+  assert.equal(r.failures.length, 0, 'batch run has no failures');
+  const batchPosts = calls.filter((c) => c === 'POST /blocks/batch').length;
+  const singlePosts = calls.filter((c) => c === 'POST /blocks').length;
+  assert.ok(batchPosts >= 1, 'at least one batch POST was made');
+  assert.ok(singlePosts <= 2, `single-block POSTs come only from arena-ref fallbacks (got ${singlePosts})`);
+  const createdChannel = [...S.channels.values()].find((c) => c.title === 'Type');
+  assert.equal(createdChannel.visibility, 'private', 'batch mode forced the new channel private');
+  assert.ok(createdChannel.items.length > 0, 'blocks landed in the channel');
+  console.log('✓ batch mode (happy path)', r.counts);
+}
+
+/* Batch mode without Premium: 403 on first batch disables batching; main loop finishes with single-POSTs. */
+{
+  const plan = T.buildPlan(cosmos, { selected: ['1'], visibility: 'private' });
+  const { S, fetchImpl } = mockArena({ fail500Once: false, noBatch: true });
+  const calls = [];
+  const spied = (url, init) => (calls.push(`${init.method} ${new URL(url).pathname.replace('/v3', '').split('?')[0]}`), fetchImpl(url, init));
+  const logs = [];
+  const r = await T.runImport({ plan, client: client(spied), journal: T.emptyJournal(), me, batchMode: true, emit: (e) => e.type === 'log' && logs.push(e) });
+  assert.equal(r.failures.length, 0, 'fallback import has no failures');
+  const batchPosts = calls.filter((c) => c === 'POST /blocks/batch').length;
+  const singlePosts = calls.filter((c) => c === 'POST /blocks').length;
+  assert.equal(batchPosts, 1, 'only one batch attempt before fallback');
+  assert.ok(singlePosts > 0, 'main loop took over with single POSTs');
+  assert.ok(logs.some((l) => l.level === 'warn' && /batch mode disabled/i.test(l.message)), 'fallback is surfaced in the log');
+  console.log('✓ batch mode falls back on 403', r.counts);
 }
 
 console.log('ALL TESTS PASS');
